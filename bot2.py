@@ -11,6 +11,7 @@ import telegram
 from datetime import date
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters, CommandHandler
+from telegram.request import HTTPXRequest
 
 # New imports for music feature
 import spotipy
@@ -228,7 +229,7 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url
         final_artist = artist if artist else None
 
         with open(temp_file, 'rb') as audio:
-            await update.message.reply_audio(audio, title=final_title, performer=final_artist)
+            await update.message.reply_audio(audio, title=final_title, performer=final_artist, write_timeout=300, read_timeout=300, connect_timeout=60)
 
         increment_success()
         await msg.edit_text(build_status('✅ Done.'))
@@ -375,7 +376,7 @@ async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_
         except Exception: pass
 
         with open(temp_file, 'rb') as video:
-            await update.message.reply_video(video)
+            await update.message.reply_video(video, write_timeout=300, read_timeout=300, connect_timeout=60)
 
         increment_success()
         try: await msg.edit_text(build_status('✅ Done.'))
@@ -433,7 +434,8 @@ if __name__ == '__main__':
     if not TOKEN or not ALLOWED_USERS:
         raise ValueError("BOT_TOKEN and ALLOWED_USER_IDS are required")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    t_request = HTTPXRequest(http_version="1.1", connection_pool_size=10, read_timeout=300.0, write_timeout=300.0, connect_timeout=300.0, pool_timeout=300.0)
+    app = ApplicationBuilder().token(TOKEN).request(t_request).build()
     
     # Register the error handler
     app.add_error_handler(error_handler)
