@@ -8,8 +8,10 @@ import uuid
 import time
 import random
 import telegram
+import instaloader
+import http.cookiejar
 from datetime import date
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters, CommandHandler
 from telegram.request import HTTPXRequest
 
@@ -83,6 +85,98 @@ def get_cookie_file(url: str) -> str:
         return './cookie_youtube.txt'
     return ''
 
+async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    shortcode_match = re.search(r'(?:instagram\.com|instagr\.am)/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
+    if not shortcode_match:
+        await download_and_send_video(update, context)
+        return
+
+    shortcode = shortcode_match.group(1)
+    msg = await update.message.reply_text(build_status('⏳ Fetching Instagram metadata...'))
+    
+    try:
+        L = instaloader.Instaloader(
+            download_pictures=False,
+            download_videos=False, 
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+        )
+        
+        cookie_file = get_cookie_file(url)
+        if os.path.exists(cookie_file):
+            cj = http.cookiejar.MozillaCookieJar(cookie_file)
+            cj.load()
+            L.context._session.cookies = cj
+
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+        if post.typename == 'GraphVideo':
+            await msg.delete()
+            await download_and_send_video(update, context)
+            return
+
+        elif post.typename == 'GraphImage':
+            await msg.edit_text(build_status('⏳ Downloading image...'))
+            r = L.context._session.get(post.url)
+            filename = f"{TEMP_FOLDER}/{shortcode}.jpg"
+            with open(filename, 'wb') as f:
+                f.write(r.content)
+            
+            await update.message.reply_photo(open(filename, 'rb'))
+            os.remove(filename)
+            await msg.edit_text(build_status('✅ Done.'))
+            increment_success()
+
+        elif post.typename == 'GraphSidecar':
+            await msg.edit_text(build_status('⏳ Downloading carousel...'))
+            media_group = []
+            files_to_cleanup = []
+            
+            nodes = list(post.get_sidecar_nodes())
+            
+            for i, node in enumerate(nodes):
+                if node.is_video:
+                    video_url = node.video_url
+                    fname = f"{TEMP_FOLDER}/{shortcode}_{i}.mp4"
+                    r = L.context._session.get(video_url)
+                    with open(fname, 'wb') as f:
+                        f.write(r.content)
+                    media_group.append(InputMediaVideo(open(fname, 'rb')))
+                    files_to_cleanup.append(fname)
+                else:
+                    image_url = node.display_url
+                    fname = f"{TEMP_FOLDER}/{shortcode}_{i}.jpg"
+                    r = L.context._session.get(image_url)
+                    with open(fname, 'wb') as f:
+                        f.write(r.content)
+                    media_group.append(InputMediaPhoto(open(fname, 'rb')))
+                    files_to_cleanup.append(fname)
+            
+            chunk_size = 10
+            for i in range(0, len(media_group), chunk_size):
+                chunk = media_group[i:i + chunk_size]
+                await update.message.reply_media_group(chunk)
+            
+            for f in files_to_cleanup:
+                if os.path.exists(f): os.remove(f)
+                
+            await msg.edit_text(build_status('✅ Done.'))
+            increment_success()
+        
+        else:
+             await msg.delete()
+             await download_and_send_video(update, context)
+
+    except Exception as e:
+        logging.error(f"Instaloader error: {e}")
+        await msg.edit_text(build_status(f'⚠️ Instaloader failed, trying fallback...'))
+        await download_and_send_video(update, context)
+
 # Universal message router
 async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -95,8 +189,10 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     
-    # Route to video downloader for specific URLs
-    if 'instagram.com' in text or 'youtube.com' in text or 'youtu.be' in text:
+    # Route to specific downloaders
+    if 'instagram.com' in text:
+        await process_instagram_link(update, context)
+    elif 'youtube.com' in text or 'youtu.be' in text:
         await download_and_send_video(update, context)
     # All other text is treated as a song request (name or spotify link)
     else:
