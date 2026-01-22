@@ -66,7 +66,9 @@ def increment_fail() -> None:
     TOTAL_FAIL += 1
 
 def get_stats_text() -> str:
-    return f"success: {TOTAL_SUCCESS}, failures: {TOTAL_FAIL}"
+    ig_stat = check_cookie_status('./cookie_instagram.txt', 'Insta')
+    yt_stat = check_cookie_status('./cookie_youtube.txt', 'YouTube')
+    return f"Stats: {TOTAL_SUCCESS} ✅ / {TOTAL_FAIL} ❌\nCookies:\n{ig_stat}\n{yt_stat}"
 
 def build_status(stage: str, attempt: int | None = None, max_attempts: int | None = None, progress: str | None = None) -> str:
     parts = [stage]
@@ -76,6 +78,40 @@ def build_status(stage: str, attempt: int | None = None, max_attempts: int | Non
         parts.append(progress)
     parts.append(f"— {get_stats_text()}")
     return ' '.join(parts)
+
+# Helper to check cookie expiration
+def check_cookie_status(file_path: str, service_name: str) -> str:
+    if not os.path.exists(file_path):
+        return f"{service_name}: ❌ No file"
+    
+    try:
+        cj = http.cookiejar.MozillaCookieJar(file_path)
+        cj.load()
+        
+        # Look for critical cookies first
+        critical_names = ['sessionid'] if 'instagram' in service_name.lower() else ['SID', '__Secure-3PSID']
+        
+        min_expiry = None
+        
+        for cookie in cj:
+            if not cookie.expires: continue
+            # If it's a critical cookie or we haven't found any expiry yet
+            if cookie.name in critical_names or min_expiry is None:
+                if min_expiry is None or cookie.expires < min_expiry:
+                    min_expiry = cookie.expires
+        
+        if min_expiry:
+            days = (min_expiry - time.time()) / 86400
+            if days < 0:
+                 return f"{service_name}: 🔴 EXPIRED ({abs(days):.1f} days ago)"
+            elif days < 3:
+                 return f"{service_name}: 🟠 {days:.1f} days left"
+            return f"{service_name}: 🟢 {days:.1f} days left"
+        
+        return f"{service_name}: 🟢 (Session only)"
+
+    except Exception:
+        return f"{service_name}: ⚠️ Read error"
 
 # Select cookie file by URL
 def get_cookie_file(url: str) -> str:

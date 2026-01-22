@@ -48,7 +48,7 @@ The included `docker-compose.yml` is pre-configured to use these variables.
 - **To download audio**: Send the bot a song name (e.g., `Queen - Bohemian Rhapsody`) or a Spotify track link.
 - The bot intelligently determines the request type from the message content.
 - If a video file exceeds 50 MB, it will be automatically transcoded.
-- The `/stats` command shows download statistics.
+- The `/stats` command shows download statistics and the expiration status of your cookie files (Active, Warning, Expired).
 - The bot updates a single message to show the current status (searching, downloading, uploading).
 
 ### Security
