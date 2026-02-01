@@ -11,8 +11,9 @@ services:
       - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET}
     volumes:
       # Mount cookies if you use private/limited videos
-      - /home/tolikyo/docker/igbot/Bot_IG2Telegram/cookie_instagram.txt:/app/cookie_instagram.txt:rw
-      - /home/tolikyo/docker/igbot/Bot_IG2Telegram/cookie_youtube.txt:/app/cookie_youtube.txt:rw
+      - ./cookie_instagram.txt:/app/cookie_instagram.txt:rw
+      - ./cookie_youtube.txt:/app/cookie_youtube.txt:rw
+      - ./cookie_threads.txt:/app/cookie_threads.txt:rw
       # Optional: persist temp if desired
       - ./temp:/app/temp
     restart: unless-stopped

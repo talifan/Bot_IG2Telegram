@@ -1,6 +1,6 @@
 Бот для скачивания видео из Instagram/YouTube и аудио по названию песни или ссылке из Spotify.
 
-- **Видео**: Принимает ссылки на посты, Reels, Shorts.
+- **Видео**: Принимает ссылки на посты, Reels, Shorts (Instagram, YouTube, Threads).
 - **Аудио**: Принимает текстовое название песни (например, `Daft Punk - Around the World`) или ссылку на трек из Spotify.
 
 English version: see README_EN.md
@@ -13,11 +13,12 @@ English version: see README_EN.md
 ### Куки для загрузки
 - Для Instagram: файл `cookie_instagram.txt`
 - Для YouTube: файл `cookie_youtube.txt`
+- Для Threads: файл `cookie_threads.txt`
 
 Как получить cookie:
 1. Войти в аккаунт в браузере.
 2. Установить расширение «Get cookies.txt LOCALLY».
-3. Сохранить куки в локальные файлы (`cookie_instagram.txt`, `cookie_youtube.txt`).
+3. Сохранить куки в локальные файлы (`cookie_instagram.txt`, `cookie_youtube.txt`, `cookie_threads.txt`).
 4. Не коммитить эти файлы в репозиторий — они добавлены в `.gitignore`.
 
 ### Запуск бота

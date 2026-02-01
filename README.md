@@ -1,6 +1,6 @@
 A bot to download videos from Instagram/YouTube and audio by song name or Spotify link.
 
-- **Video**: Accepts links to posts, Reels, and Shorts.
+- **Video**: Accepts links to posts, Reels, and Shorts (Instagram, YouTube, Threads).
 - **Audio**: Accepts a text-based song name (e.g., `Daft Punk - Around the World`) or a Spotify track link.
 
 Russian version: see README_RU.md
@@ -13,11 +13,12 @@ Russian version: see README_RU.md
 ### Cookies
 - For Instagram: `cookie_instagram.txt`
 - For YouTube: `cookie_youtube.txt`
+- For Threads: `cookie_threads.txt`
 
 How to get cookies:
 1. Log into your account in a browser.
 2. Install the “Get cookies.txt LOCALLY” browser extension.
-3. Save cookies into local files (`cookie_instagram.txt`, `cookie_youtube.txt`).
+3. Save cookies into local files (`cookie_instagram.txt`, `cookie_youtube.txt`, `cookie_threads.txt`).
 4. Do not commit these files to the repository—they are already in `.gitignore`.
 
 ### Running the Bot

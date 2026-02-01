@@ -7,6 +7,7 @@ import subprocess
 import uuid
 import time
 import random
+import requests
 import telegram
 import instaloader
 import http.cookiejar
@@ -65,10 +66,20 @@ def increment_fail() -> None:
     global TOTAL_FAIL
     TOTAL_FAIL += 1
 
-def get_stats_text() -> str:
-    ig_stat = check_cookie_status('./cookie_instagram.txt', 'Insta')
-    yt_stat = check_cookie_status('./cookie_youtube.txt', 'YouTube')
-    return f"Stats: {TOTAL_SUCCESS} ✅ / {TOTAL_FAIL} ❌\nCookies:\n{ig_stat}\n{yt_stat}"
+def get_stats_text(verbose: bool = False) -> str:
+    lines = [f"Stats: {TOTAL_SUCCESS} ✅ / {TOTAL_FAIL} ❌"]
+    
+    cookie_lines = []
+    for path, name in [('./cookie_instagram.txt', 'Insta'), ('./cookie_youtube.txt', 'YouTube'), ('./cookie_threads.txt', 'Threads')]:
+        stat = check_cookie_status(path, name, verbose)
+        if stat:
+            cookie_lines.append(stat)
+            
+    if cookie_lines:
+        lines.append("Cookies:")
+        lines.extend(cookie_lines)
+        
+    return '\n'.join(lines)
 
 def build_status(stage: str, attempt: int | None = None, max_attempts: int | None = None, progress: str | None = None) -> str:
     parts = [stage]
@@ -76,20 +87,20 @@ def build_status(stage: str, attempt: int | None = None, max_attempts: int | Non
         parts.append(f"(try {attempt}/{max_attempts})")
     if progress:
         parts.append(progress)
-    parts.append(f"— {get_stats_text()}")
+    parts.append(f"— {get_stats_text(verbose=False)}")
     return ' '.join(parts)
 
 # Helper to check cookie expiration
-def check_cookie_status(file_path: str, service_name: str) -> str:
+def check_cookie_status(file_path: str, service_name: str, verbose: bool = False) -> str | None:
     if not os.path.exists(file_path):
-        return f"{service_name}: ❌ No file"
+        return f"{service_name}: ❌ No file" if verbose else None
     
     try:
         cj = http.cookiejar.MozillaCookieJar(file_path)
         cj.load()
         
         # Look for critical cookies first
-        critical_names = ['sessionid'] if 'instagram' in service_name.lower() else ['SID', '__Secure-3PSID']
+        critical_names = ['sessionid'] if 'instagram' in service_name.lower() or 'threads' in service_name.lower() else ['SID', '__Secure-3PSID']
         
         min_expiry = None
         
@@ -104,19 +115,24 @@ def check_cookie_status(file_path: str, service_name: str) -> str:
             days = (min_expiry - time.time()) / 86400
             if days < 0:
                  return f"{service_name}: 🔴 EXPIRED ({abs(days):.1f} days ago)"
-            elif days < 3:
+            elif days < 10:
                  return f"{service_name}: 🟠 {days:.1f} days left"
-            return f"{service_name}: 🟢 {days:.1f} days left"
+            
+            # Healthy
+            return f"{service_name}: 🟢 {days:.1f} days left" if verbose else None
         
-        return f"{service_name}: 🟢 (Session only)"
+        return f"{service_name}: 🟢 (Session only)" if verbose else None
 
-    except Exception:
+    except Exception as e:
+        logging.error(f"Cookie check error for {service_name}: {e}")
         return f"{service_name}: ⚠️ Read error"
 
 # Select cookie file by URL
 def get_cookie_file(url: str) -> str:
     if 'instagram.com' in url:
         return './cookie_instagram.txt'
+    elif 'threads.net' in url or 'threads.com' in url:
+        return './cookie_threads.txt'
     elif 'youtube.com' in url or 'youtu.be' in url:
         return './cookie_youtube.txt'
     return ''
@@ -213,6 +229,118 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
         await msg.edit_text(build_status(f'⚠️ Instaloader failed, trying fallback...'))
         await download_and_send_video(update, context)
 
+async def process_threads_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Normalize URL: force threads.net
+    url = update.message.text.replace('threads.com', 'threads.net')
+    
+    msg = await update.message.reply_text(build_status('⏳ Checking Threads link...'))
+    
+    try:
+        # 1. Try to detect video using yt-dlp (most robust method)
+        # We use --dump-json to check if it's a supported video without downloading content yet
+        is_video = False
+        cookie_file = './cookie_threads.txt'
+        
+        # Build probe command
+        cmd = ['yt-dlp', '--dump-json', '--no-warnings', '--no-playlist']
+        if os.path.exists(cookie_file):
+            cmd.extend(['--cookies', cookie_file])
+        cmd.append(url)
+        
+        try:
+            # Timeout set to 15s to avoid hanging if yt-dlp gets stuck
+            probe = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                timeout=15
+            )
+            # If yt-dlp exits with 0 and produces output, it's a video (or supported media)
+            if probe.returncode == 0 and probe.stdout.strip():
+                is_video = True
+        except Exception as e:
+            logging.warning(f"yt-dlp probe failed: {e}")
+
+        if is_video:
+            await msg.delete()
+            # Pass the normalized URL
+            await download_and_send_video(update, context, override_url=url)
+            return
+
+        # 2. If no video detected via yt-dlp, manually check for video in HTML (JSON blob)
+        # Threads often hides video info in a big JSON blob
+        await msg.edit_text(build_status('⏳ Checking for content...'))
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        
+        # Load cookies for requests
+        cookies = {}
+        if os.path.exists(cookie_file):
+            try:
+                cj = http.cookiejar.MozillaCookieJar(cookie_file)
+                cj.load()
+                for c in cj:
+                    cookies[c.name] = c.value
+            except Exception:
+                pass
+
+        r = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+        html = r.text
+        
+        # Look for direct MP4 links in the page (usually in JSON)
+        # Pattern matches "url":"https://...mp4..." with escaped slashes
+        mp4_matches = re.findall(r'"url"\s*:\s*"([^"]+\.mp4[^"]*)"', html)
+        
+        if mp4_matches:
+            # Pick the longest URL as it's often the highest quality or the main video
+            # Unescape slashes
+            video_url = max(mp4_matches, key=len).replace(r'\/', '/')
+            # Ensure it starts with http
+            if not video_url.startswith('http'):
+                video_url = None
+            
+            if video_url:
+                await msg.delete()
+                # Pass the DIRECT video URL to download_and_send_video
+                # This bypasses yt-dlp extraction logic for the main page
+                await download_and_send_video(update, context, override_url=video_url)
+                return
+            
+        # Check for og:image
+        og_image = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+        if og_image:
+            image_url = og_image.group(1).replace('&amp;', '&')
+            await msg.edit_text(build_status('⏳ Downloading image...'))
+            
+            unique_id = str(uuid.uuid4())
+            fname = f"{TEMP_FOLDER}/{unique_id}.jpg"
+            
+            img_r = requests.get(image_url, headers=headers, timeout=30)
+            if img_r.status_code == 200:
+                with open(fname, 'wb') as f:
+                    f.write(img_r.content)
+                
+                await update.message.reply_photo(open(fname, 'rb'))
+                os.remove(fname)
+                await msg.edit_text(build_status('✅ Done.'))
+                increment_success()
+                return
+
+        # If neither, try fallback to video just in case (using normalized URL)
+        await msg.delete()
+        await download_and_send_video(update, context, override_url=url)
+
+    except Exception as e:
+        logging.error(f"Threads error: {e}")
+        # Last resort
+        await msg.edit_text(build_status(f'⚠️ Error, trying fallback...'))
+        await download_and_send_video(update, context, override_url=url)
+
 # Universal message router
 async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -228,6 +356,8 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Route to specific downloaders
     if 'instagram.com' in text:
         await process_instagram_link(update, context)
+    elif 'threads.net' in text or 'threads.com' in text:
+        await process_threads_link(update, context)
     elif 'youtube.com' in text or 'youtu.be' in text:
         await download_and_send_video(update, context)
     # All other text is treated as a song request (name or spotify link)
@@ -400,14 +530,14 @@ def compress_video(input_path: str, output_path: str) -> bool:
         return False
 
 # Download and send video
-async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, override_url: str | None = None):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS:
         await update.message.reply_text('⛔️ You are not allowed to use this bot.')
         logging.warning(f"Access denied for user_id: {user_id}")
         return
 
-    url = update.message.text
+    url = override_url if override_url else update.message.text
     msg = await update.message.reply_text(build_status('⏳ Downloading video...'))
 
     unique_id = str(uuid.uuid4())
@@ -554,7 +684,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS: return
-    await update.message.reply_text(f'Stats: {get_stats_text()}')
+    await update.message.reply_text(get_stats_text(verbose=True))
 
 
 # Generic error handler

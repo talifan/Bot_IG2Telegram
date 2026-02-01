@@ -10,4 +10,5 @@ stats.json
 # Secrets (do not commit cookies)
 cookie_instagram.txt
 cookie_youtube.txt
+cookie_threads.txt
 secrets/
