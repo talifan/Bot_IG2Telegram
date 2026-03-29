@@ -11,6 +11,8 @@ import requests
 import telegram
 import instaloader
 import http.cookiejar
+import json
+import tempfile
 from datetime import date
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters, CommandHandler
@@ -40,6 +42,116 @@ def parse_allowed_users(env_value: str) -> set[int]:
     return users
 
 ALLOWED_USERS = parse_allowed_users(os.getenv('ALLOWED_USER_IDS', ''))
+
+# Robustly load cookies into a MozillaCookieJar
+def load_cookies_to_jar(file_path: str) -> http.cookiejar.MozillaCookieJar:
+    cj = http.cookiejar.MozillaCookieJar(file_path)
+    if not os.path.exists(file_path):
+        return cj
+
+    # 1. Try standard load
+    try:
+        cj.load(ignore_discard=True, ignore_expires=True)
+        if len(cj) > 0:
+            return cj
+    except Exception:
+        pass
+
+    # 2. Try detection and conversion
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().strip()
+            
+        if not content:
+            return cj
+
+        # Detect JSON
+        if content.startswith('[') and content.endswith(']'):
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    for c in data:
+                        name = c.get('name')
+                        value = c.get('value')
+                        domain = c.get('domain')
+                        if not (name and value and domain): continue
+                        
+                        path = c.get('path', '/')
+                        # Handle different formats for expiration date
+                        expires = c.get('expirationDate') or c.get('expiry') or c.get('expires')
+                        # Convert string expiry to int if needed (some extensions do this)
+                        if isinstance(expires, str) and expires.isdigit():
+                            expires = int(expires)
+                        
+                        ck = http.cookiejar.Cookie(
+                            version=0, name=name, value=value,
+                            port=None, port_specified=False,
+                            domain=domain, domain_specified=True,
+                            domain_initial_dot=domain.startswith('.'),
+                            path=path, path_specified=True,
+                            secure=c.get('secure', False),
+                            expires=expires,
+                            discard=False, comment=None, comment_url=None, 
+                            rest={'HttpOnly': c.get('httpOnly', False)}, rfc2109=False
+                        )
+                        cj.set_cookie(ck)
+                    if len(cj) > 0:
+                        return cj
+            except Exception:
+                pass
+        
+        # Detect Netscape missing header
+        lines = content.splitlines()
+        has_tab_cols = False
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            if len(line.split('\t')) >= 7:
+                has_tab_cols = True
+                break
+        
+        if has_tab_cols:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+                tmp.write("# Netscape HTTP Cookie File\n" + content)
+                tmp_name = tmp.name
+            try:
+                cj_tmp = http.cookiejar.MozillaCookieJar(tmp_name)
+                cj_tmp.load(ignore_discard=True, ignore_expires=True)
+                os.unlink(tmp_name)
+                return cj_tmp
+            except Exception:
+                if os.path.exists(tmp_name): os.unlink(tmp_name)
+
+    except Exception as e:
+        logging.error(f"Error loading cookies from {file_path}: {e}")
+
+    return cj
+
+# Get a cookie file that is guaranteed to be in Netscape format for yt-dlp
+def get_safe_cookie_file(url: str) -> str | None:
+    original_path = get_cookie_file(url)
+    if not original_path or not os.path.exists(original_path):
+        return None
+        
+    try:
+        with open(original_path, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline()
+            if first_line.startswith('# Netscape'):
+                return original_path
+    except Exception:
+        pass
+        
+    # Need conversion
+    try:
+        cj = load_cookies_to_jar(original_path)
+        if len(cj) > 0:
+            temp_path = os.path.join(TEMP_FOLDER, os.path.basename(original_path) + ".converted.txt")
+            cj.save(temp_path, ignore_discard=True, ignore_expires=True)
+            return temp_path
+    except Exception as e:
+        logging.error(f"Failed to prepare safe cookie file: {e}")
+        
+    return original_path
 
 # In-memory stats for process lifetime (reset on container restart)
 TOTAL_SUCCESS = 0
@@ -96,8 +208,7 @@ def check_cookie_status(file_path: str, service_name: str, verbose: bool = False
         return f"{service_name}: ❌ No file" if verbose else None
     
     try:
-        cj = http.cookiejar.MozillaCookieJar(file_path)
-        cj.load()
+        cj = load_cookies_to_jar(file_path)
         
         # Look for critical cookies first
         critical_names = ['sessionid'] if 'instagram' in service_name.lower() or 'threads' in service_name.lower() else ['SID', '__Secure-3PSID']
@@ -161,8 +272,7 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
         
         cookie_file = get_cookie_file(url)
         if os.path.exists(cookie_file):
-            cj = http.cookiejar.MozillaCookieJar(cookie_file)
-            cj.load()
+            cj = load_cookies_to_jar(cookie_file)
             L.context._session.cookies = cj
 
         post = instaloader.Post.from_shortcode(L.context, shortcode)
@@ -282,8 +392,7 @@ async def process_threads_link(update: Update, context: ContextTypes.DEFAULT_TYP
         cookies = {}
         if os.path.exists(cookie_file):
             try:
-                cj = http.cookiejar.MozillaCookieJar(cookie_file)
-                cj.load()
+                cj = load_cookies_to_jar(cookie_file)
                 for c in cj:
                     cookies[c.name] = c.value
             except Exception:
@@ -543,13 +652,19 @@ async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_
     unique_id = str(uuid.uuid4())
     temp_file = f'{TEMP_FOLDER}/{unique_id}.mp4'
     compressed_file = f'{TEMP_FOLDER}/{unique_id}_compressed.mp4'
-    cookie_file = get_cookie_file(url)
+    safe_cookie_file = get_safe_cookie_file(url)
 
     def build_command() -> list[str]:
         cmd = ['yt-dlp']
-        if cookie_file: cmd.extend(['--cookies', cookie_file])
+        if safe_cookie_file: cmd.extend(['--cookies', safe_cookie_file])
+        
+        # Optimize: Try to get best quality that fits within ~50MB limit to avoid slow transcoding
+        # We target video < 40MB and audio < 10MB approx, or single file < 50MB
+        format_selector = 'bestvideo[filesize<40M]+bestaudio[filesize<10M]/best[filesize<50M]/bestvideo+bestaudio/best'
+        
         cmd.extend([
-            '-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4',
+            '-f', format_selector, 
+            '--merge-output-format', 'mp4',
             '--no-playlist', '--newline', '-o', temp_file
         ])
         if 'instagram.com' in url:
