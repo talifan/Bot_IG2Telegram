@@ -14,7 +14,7 @@ import http.cookiejar
 import json
 import tempfile
 from datetime import date
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters, CommandHandler
 from telegram.request import HTTPXRequest
 
@@ -248,6 +248,53 @@ def get_cookie_file(url: str) -> str:
         return './cookie_youtube.txt'
     return ''
 
+def build_safe_audio_filename(song_title: str | None, artist: str | None) -> str:
+    base_name = f"{artist} - {song_title}" if artist and song_title else (song_title or artist or "Audio")
+    safe_name = re.sub(r'[\\\\/:*?\"<>|]+', '_', base_name)
+    safe_name = re.sub(r'\s+', ' ', safe_name).strip().strip('.')
+    if not safe_name:
+        safe_name = "Audio"
+    return f"{safe_name}.mp3"
+
+def resolve_audio_source(query: str) -> str:
+    if not query.startswith('ytsearch'):
+        return query
+
+    safe_cookie_file = get_safe_cookie_file('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+    search_command = [
+        'yt-dlp',
+        '--flat-playlist',
+        '--print', '%(id)s\t%(title)s',
+        query.replace('ytsearch1:', 'ytsearch10:', 1)
+    ]
+    if safe_cookie_file:
+        search_command[1:1] = ['--cookies', safe_cookie_file]
+    search_command[1:1] = ['--js-runtimes', 'node']
+
+    search_proc = subprocess.run(search_command, check=True, capture_output=True, text=True)
+    candidates = [line.strip() for line in search_proc.stdout.splitlines() if line.strip()]
+    if not candidates:
+        raise RuntimeError("No YouTube search results found")
+
+    probe_base = ['yt-dlp', '--skip-download', '--print', '%(id)s']
+    if safe_cookie_file:
+        probe_base.extend(['--cookies', safe_cookie_file])
+    probe_base.extend(['--js-runtimes', 'node'])
+
+    for candidate in candidates:
+        video_id = candidate.split('\t', 1)[0].strip()
+        if not video_id:
+            continue
+        candidate_url = f'https://www.youtube.com/watch?v={video_id}'
+        probe = subprocess.run(probe_base + [candidate_url], capture_output=True, text=True)
+        if probe.returncode == 0:
+            logging.info(f"Selected audio source candidate: {candidate_url}")
+            return candidate_url
+        stderr = (probe.stderr or '').strip()
+        logging.info(f"Skipping audio candidate {video_id}: {stderr}")
+
+    raise RuntimeError("No downloadable YouTube candidates found")
+
 async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     shortcode_match = re.search(r'(?:instagram\.com|instagr\.am)/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
@@ -452,6 +499,10 @@ async def process_threads_link(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # Universal message router
 async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or update.message is None:
+        logging.warning("Ignoring update without effective user or message")
+        return
+
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS:
         await update.message.reply_text('⛔️ You are not allowed to use this bot.')
@@ -513,8 +564,8 @@ async def handle_song_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     search_query = f"{artist} {song_title}" if artist else song_title
     try:
         await msg.edit_text(build_status(f'⏳ Starting download for "{search_query}"...'))
-        # Pass the ytsearch query directly to download_audio
-        await download_audio(update, context, f'ytsearch1:{search_query}', song_title, artist, msg)
+        audio_source = resolve_audio_source(f'ytsearch1:{search_query}')
+        await download_audio(update, context, audio_source, song_title, artist, msg)
 
     except Exception:
         logging.exception("YouTube search error")
@@ -525,13 +576,17 @@ async def handle_song_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, song_title: str, artist: str | None, msg):
     unique_id = str(uuid.uuid4())
     temp_file_pattern = f'{TEMP_FOLDER}/{unique_id}.%(ext)s'
+    safe_cookie_file = get_safe_cookie_file(url if not url.startswith('ytsearch') else 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
     
     command = [
         'yt-dlp', '-x', '--audio-format', 'mp3', '--audio-quality', '0',
         '--no-playlist', '--newline',
         '--metadata-from-title', "%(artist)s - %(title)s",
-        '--embed-thumbnail', '-o', temp_file_pattern, url
+        '--embed-thumbnail', '-o', temp_file_pattern
     ]
+    if safe_cookie_file:
+        command.extend(['--cookies', safe_cookie_file])
+    command.extend(['--js-runtimes', 'node', url])
 
     last_err_text = ''
     try:
@@ -598,9 +653,11 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url
         
         final_title = song_title if song_title else "Audio"
         final_artist = artist if artist else None
+        file_name = build_safe_audio_filename(song_title, artist)
 
         with open(temp_file, 'rb') as audio:
-            await update.message.reply_audio(audio, title=final_title, performer=final_artist, write_timeout=300, read_timeout=300, connect_timeout=60)
+            telegram_audio = InputFile(audio, filename=file_name)
+            await update.message.reply_audio(telegram_audio, title=final_title, performer=final_artist, write_timeout=300, read_timeout=300, connect_timeout=60)
 
         increment_success()
         await msg.edit_text(build_status('✅ Done.'))
@@ -613,7 +670,11 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url
         err_text = (last_err_text or getattr(e, 'stderr', '') or '').strip()
         logging.error(f"Audio download error: {err_text}")
         increment_fail()
-        await msg.edit_text(build_status('❌ Failed to download audio.'))
+        low = err_text.lower()
+        if 'sign in to confirm your age' in low or 'login required' in low:
+            await msg.edit_text(build_status('❌ YouTube login/age confirmation required.'))
+        else:
+            await msg.edit_text(build_status('❌ Failed to download audio.'))
     except Exception as e:
         logging.exception("Unexpected error in audio download")
         increment_fail()
@@ -626,17 +687,45 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url
 
 # Transcode video to fit Telegram limit
 def compress_video(input_path: str, output_path: str) -> bool:
-    try:
-        command = [
-            'ffmpeg', '-i', input_path, '-vf', 'scale=w=640:h=-2', '-c:v', 'libx264',
-            '-preset', 'fast', '-crf', '28', '-c:a', 'aac', '-b:a', '128k',
-            '-movflags', '+faststart', output_path
-        ]
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return os.path.exists(output_path) and os.path.getsize(output_path) <= 50 * 1024 * 1024
-    except Exception as e:
-        logging.error(f"Video transcode error: {e}")
-        return False
+    max_size = 50 * 1024 * 1024
+    profiles = [
+        {'width': 640, 'crf': 28, 'audio_bitrate': '96k'},
+        {'width': 540, 'crf': 30, 'audio_bitrate': '80k'},
+        {'width': 480, 'crf': 32, 'audio_bitrate': '64k'},
+    ]
+
+    for idx, profile in enumerate(profiles, start=1):
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+            command = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-vf', f"scale=w={profile['width']}:h=-2",
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', str(profile['crf']),
+                '-c:a', 'aac',
+                '-b:a', profile['audio_bitrate'],
+                '-movflags', '+faststart',
+                output_path
+            ]
+            proc = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if os.path.exists(output_path):
+                size = os.path.getsize(output_path)
+                logging.info(
+                    f"Transcode profile {idx} produced {size / (1024 * 1024):.2f} MiB "
+                    f"(width={profile['width']}, crf={profile['crf']}, audio={profile['audio_bitrate']})"
+                )
+                if size <= max_size:
+                    return True
+        except subprocess.CalledProcessError as e:
+            stderr_tail = (e.stderr or '').strip()[-1200:]
+            logging.error(f"Video transcode error on profile {idx}: {stderr_tail}")
+        except Exception as e:
+            logging.error(f"Video transcode error on profile {idx}: {e}")
+
+    return False
 
 # Download and send video
 async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, override_url: str | None = None):
