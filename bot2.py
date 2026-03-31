@@ -256,6 +256,17 @@ def build_safe_audio_filename(song_title: str | None, artist: str | None) -> str
         safe_name = "Audio"
     return f"{safe_name}.mp3"
 
+def build_safe_video_filename(url: str) -> str:
+    if 'instagram.com' in url or 'instagr.am' in url:
+        base_name = 'instagram_video'
+    elif 'threads.net' in url or 'threads.com' in url:
+        base_name = 'threads_video'
+    elif 'youtube.com' in url or 'youtu.be' in url:
+        base_name = 'youtube_video'
+    else:
+        base_name = 'video'
+    return f"{base_name}.mp4"
+
 def resolve_audio_source(query: str) -> str:
     if not query.startswith('ytsearch'):
         return query
@@ -294,6 +305,94 @@ def resolve_audio_source(query: str) -> str:
         logging.info(f"Skipping audio candidate {video_id}: {stderr}")
 
     raise RuntimeError("No downloadable YouTube candidates found")
+
+def probe_video_metadata(input_path: str) -> dict[str, object]:
+    command = [
+        'ffprobe', '-v', 'error',
+        '-print_format', 'json',
+        '-show_streams',
+        '-show_format',
+        input_path
+    ]
+    proc = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    data = json.loads(proc.stdout)
+    streams = data.get('streams', [])
+    video_stream = next((stream for stream in streams if stream.get('codec_type') == 'video'), None)
+    if not video_stream:
+        raise RuntimeError("No video stream found")
+
+    rotation = 0
+    tags = video_stream.get('tags') or {}
+    if isinstance(tags, dict) and tags.get('rotate'):
+        try:
+            rotation = int(float(tags['rotate']))
+        except (TypeError, ValueError):
+            rotation = 0
+
+    if rotation == 0:
+        for side_data in video_stream.get('side_data_list') or []:
+            side_rotation = side_data.get('rotation')
+            if side_rotation is None:
+                continue
+            try:
+                rotation = int(float(side_rotation))
+                break
+            except (TypeError, ValueError):
+                continue
+
+    rotation = rotation % 360
+    width = int(video_stream.get('width') or 0)
+    height = int(video_stream.get('height') or 0)
+    sample_aspect_ratio = str(video_stream.get('sample_aspect_ratio') or '1:1')
+    display_aspect_ratio = str(video_stream.get('display_aspect_ratio') or '0:1')
+    if rotation in (90, 270):
+        display_width, display_height = height, width
+    else:
+        display_width, display_height = width, height
+
+    return {
+        'rotation': rotation,
+        'width': width,
+        'height': height,
+        'display_width': display_width,
+        'display_height': display_height,
+        'sample_aspect_ratio': sample_aspect_ratio,
+        'display_aspect_ratio': display_aspect_ratio,
+    }
+
+def build_video_normalization_filter(video_meta: dict[str, object], target_width: int, target_height: int) -> str:
+    filters: list[str] = []
+    rotation = int(video_meta.get('rotation') or 0)
+    if rotation == 90:
+        filters.append('transpose=1')
+    elif rotation == 180:
+        filters.extend(['hflip', 'vflip'])
+    elif rotation == 270:
+        filters.append('transpose=2')
+
+    filters.append(
+        f"scale=w={target_width}:h={target_height}:force_original_aspect_ratio=decrease"
+    )
+    filters.append(f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2")
+    filters.append('setsar=1')
+    filters.append(f"setdar={target_width}/{target_height}")
+    return ','.join(filters)
+
+def build_video_profiles(is_vertical: bool) -> list[dict[str, object]]:
+    if is_vertical:
+        return [
+            {'width': 720, 'height': 1280, 'crf': 18, 'audio_bitrate': '128k'},
+            {'width': 540, 'height': 960, 'crf': 21, 'audio_bitrate': '96k'},
+            {'width': 480, 'height': 854, 'crf': 24, 'audio_bitrate': '80k'},
+            {'width': 360, 'height': 640, 'crf': 26, 'audio_bitrate': '64k'},
+        ]
+
+    return [
+        {'width': 1280, 'height': 720, 'crf': 18, 'audio_bitrate': '128k'},
+        {'width': 960, 'height': 540, 'crf': 21, 'audio_bitrate': '96k'},
+        {'width': 854, 'height': 480, 'crf': 24, 'audio_bitrate': '80k'},
+        {'width': 640, 'height': 360, 'crf': 26, 'audio_bitrate': '64k'},
+    ]
 
 async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -685,39 +784,56 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, url
             if os.path.exists(f):
                 os.remove(f)
 
-# Transcode video to fit Telegram limit
-def compress_video(input_path: str, output_path: str) -> bool:
+# Normalize/transcode video to fit Telegram limit and remove problematic metadata
+def compress_video(input_path: str, output_path: str, prefer_vertical: bool | None = None) -> bool:
     max_size = 50 * 1024 * 1024
-    profiles = [
-        {'width': 640, 'crf': 28, 'audio_bitrate': '96k'},
-        {'width': 540, 'crf': 30, 'audio_bitrate': '80k'},
-        {'width': 480, 'crf': 32, 'audio_bitrate': '64k'},
-    ]
+    video_meta = probe_video_metadata(input_path)
+    display_width = int(video_meta.get('display_width') or 0)
+    display_height = int(video_meta.get('display_height') or 0)
+    is_vertical = prefer_vertical if prefer_vertical is not None else display_height >= display_width
+    profiles = build_video_profiles(is_vertical)
 
     for idx, profile in enumerate(profiles, start=1):
         try:
             if os.path.exists(output_path):
                 os.remove(output_path)
 
+            target_width = int(profile['width'])
+            target_height = int(profile['height'])
+            vf = build_video_normalization_filter(video_meta, target_width, target_height)
             command = [
                 'ffmpeg', '-y', '-i', input_path,
-                '-vf', f"scale=w={profile['width']}:h=-2",
+                '-map', '0:v:0', '-map', '0:a?',
+                '-map_metadata', '-1',
+                '-vf', vf,
                 '-c:v', 'libx264',
                 '-preset', 'fast',
                 '-crf', str(profile['crf']),
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'high',
+                '-level', '4.0',
                 '-c:a', 'aac',
                 '-b:a', profile['audio_bitrate'],
+                '-metadata:s:v:0', 'rotate=0',
                 '-movflags', '+faststart',
                 output_path
             ]
-            proc = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if os.path.exists(output_path):
                 size = os.path.getsize(output_path)
                 logging.info(
                     f"Transcode profile {idx} produced {size / (1024 * 1024):.2f} MiB "
-                    f"(width={profile['width']}, crf={profile['crf']}, audio={profile['audio_bitrate']})"
+                    f"(target={target_width}x{target_height}, crf={profile['crf']}, audio={profile['audio_bitrate']}, "
+                    f"rotation={video_meta.get('rotation')}, sar={video_meta.get('sample_aspect_ratio')}, "
+                    f"dar={video_meta.get('display_aspect_ratio')})"
                 )
                 if size <= max_size:
+                    normalized_meta = probe_video_metadata(output_path)
+                    logging.info(
+                        f"Normalized output meta: {normalized_meta.get('display_width')}x{normalized_meta.get('display_height')}, "
+                        f"rotation={normalized_meta.get('rotation')}, sar={normalized_meta.get('sample_aspect_ratio')}, "
+                        f"dar={normalized_meta.get('display_aspect_ratio')}"
+                    )
                     return True
         except subprocess.CalledProcessError as e:
             stderr_tail = (e.stderr or '').strip()[-1200:]
@@ -828,10 +944,12 @@ async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_
                 await msg.edit_text('❌ Video was not downloaded.')
                 return
 
-        if os.path.getsize(temp_file) > 50 * 1024 * 1024:
-            try: await msg.edit_text(build_status('⚙️ Large video, transcoding...'))
+        needs_instagram_normalization = 'instagram.com' in url or 'instagr.am' in url
+        if needs_instagram_normalization or os.path.getsize(temp_file) > 50 * 1024 * 1024:
+            stage_text = '⚙️ Normalizing video...' if needs_instagram_normalization else '⚙️ Large video, transcoding...'
+            try: await msg.edit_text(build_status(stage_text))
             except Exception: pass
-            if not compress_video(temp_file, compressed_file):
+            if not compress_video(temp_file, compressed_file, prefer_vertical=None):
                 await msg.edit_text(build_status('❌ Failed to transcode video.'))
                 return
             os.remove(temp_file)
@@ -841,8 +959,22 @@ async def download_and_send_video(update: Update, context: ContextTypes.DEFAULT_
         try: await msg.edit_text(build_status('📤 Uploading video...'))
         except Exception: pass
 
+        output_meta = probe_video_metadata(temp_file)
+        video_width = int(output_meta.get('display_width') or output_meta.get('width') or 0) or None
+        video_height = int(output_meta.get('display_height') or output_meta.get('height') or 0) or None
+        video_filename = build_safe_video_filename(url)
+
         with open(temp_file, 'rb') as video:
-            await update.message.reply_video(video, write_timeout=300, read_timeout=300, connect_timeout=60)
+            await update.message.reply_video(
+                video,
+                width=video_width,
+                height=video_height,
+                supports_streaming=True,
+                filename=video_filename,
+                write_timeout=300,
+                read_timeout=300,
+                connect_timeout=60
+            )
 
         increment_success()
         try: await msg.edit_text(build_status('✅ Done.'))
