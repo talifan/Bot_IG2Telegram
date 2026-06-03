@@ -390,6 +390,19 @@ def is_saveasbot_service_text(text: str | None) -> bool:
 def is_saveasbot_quality_document_text(text: str | None) -> bool:
     return clean_saveasbot_text(text).startswith('Для ценителей качества')
 
+def is_saveasbot_terminal_error_text(text: str | None) -> bool:
+    cleaned = clean_saveasbot_text(text).lower()
+    if not cleaned:
+        return False
+    terminal_markers = (
+        'не удалось получить информацию о публикации',
+        'не удалось скачать',
+        'публикация недоступна',
+        'закрытый (приватный) аккаунт',
+        'возрастные ограничения',
+    )
+    return any(marker in cleaned for marker in terminal_markers)
+
 def should_skip_saveasbot_media(text: str, kind: str, source_url: str, has_video_media: bool, has_primary_media: bool) -> bool:
     if is_saveasbot_marketing_text(text):
         return True
@@ -561,6 +574,9 @@ async def collect_saveasbot_responses(client, peer, after_message_id: int, timeo
 
             if len(responses_by_id) >= max_responses:
                 break
+            text = clean_saveasbot_text(getattr(message, 'message', '') or '')
+            if not getattr(message, 'media', None) and is_saveasbot_terminal_error_text(text):
+                return list(responses_by_id.values())
 
         responses = list(responses_by_id.values())
         if responses and not saw_new:
@@ -606,6 +622,7 @@ async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
         peer = await get_saveasbot_peer(client)
         await warmup_saveasbot_dialog(client, peer)
 
+        logging.info(f"Sending Instagram URL to SaveAsBot: {url}")
         sent = await client.send_message(peer, url)
         sent_id = getattr(sent, 'id', 0) or 0
         responses = await collect_saveasbot_responses(
@@ -615,6 +632,7 @@ async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
             SAVEASBOT_TIMEOUT_SEC,
             SAVEASBOT_MAX_RESPONSES,
         )
+        logging.info(f"SaveAsBot returned {len(responses)} response message(s) for sent_id={sent_id}")
 
         items: list[dict[str, object]] = []
         response_meta = [
@@ -652,6 +670,7 @@ async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
             elif text and not is_saveasbot_service_text(text):
                 items.append({'kind': 'text', 'text': text})
 
+        logging.info(f"Prepared {len(items)} SaveAsBot item(s) for Telegram reply")
         return items
 
 async def send_text_chunks(update: Update, text: str) -> None:

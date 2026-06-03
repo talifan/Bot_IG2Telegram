@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 - **feat: Route Instagram links through @SaveAsBot**: Instagram requests now use a live Telegram user session via Telethon, send the link to `@SaveAsBot`, download the bot response, and relay it to the original requester.
 - **fix: Avoid Telethon update parsing failures in the Instagram bridge**: The SaveAsBot bridge now resolves `@SaveAsBot` from the session cache or explicit peer IDs, disables background updates, polls the direct dialog history for replies, and keeps media messages even when `@SaveAsBot` adds service captions.
 - **fix: Filter SaveAsBot ads from Instagram video replies**: Reel/Stories responses now drop marketing text, bonus/ad images, and non-video media when the requested response includes video.
+- **fix: Return SaveAsBot terminal errors immediately**: Explicit failure messages such as private/age-restricted Instagram publications now end the bridge wait loop immediately and are relayed back as text.
 - **chore: Add SaveAsBot Docker configuration**: `docker-compose.yml` now accepts `SAVEASBOT_*` variables, mounts a read-only Telethon session file, and ignores local `.session` files.
 - **docs: Update Instagram operation docs**: README files now describe the SaveAsBot bridge and remove Instagram cookie requirements.
 
