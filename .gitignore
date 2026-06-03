@@ -11,4 +11,6 @@ stats.json
 cookie_instagram.txt
 cookie_youtube.txt
 cookie_threads.txt
+*.session
+*.session-journal
 secrets/

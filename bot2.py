@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import glob
 import logging
 import re
@@ -8,12 +10,15 @@ import uuid
 import time
 import random
 import requests
+import shutil
 import telegram
 import instaloader
 import http.cookiejar
 import json
 import tempfile
+import sqlite3
 from datetime import date
+from pathlib import Path
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters, CommandHandler
 from telegram.request import HTTPXRequest
@@ -22,9 +27,62 @@ from telegram.request import HTTPXRequest
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
+try:
+    from telethon import TelegramClient
+    from telethon.errors import RPCError
+    from telethon.tl.types import InputPeerUser
+except ImportError:  # pragma: no cover - runtime dependency is optional until Instagram bridge is used
+    TelegramClient = None  # type: ignore[assignment]
+    RPCError = Exception  # type: ignore[assignment]
+    InputPeerUser = None  # type: ignore[assignment]
+
 # Config from environment
 TOKEN = os.getenv('BOT_TOKEN')
 TEMP_FOLDER = './temp'
+
+def get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning(f"Invalid integer value for {name}: {value!r}; using {default}")
+        return default
+
+def get_env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logging.warning(f"Invalid float value for {name}: {value!r}; using {default}")
+        return default
+
+def get_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+SAVEASBOT_USERNAME = os.getenv('SAVEASBOT_USERNAME', 'SaveAsBot')
+SAVEASBOT_API_ID = os.getenv('SAVEASBOT_API_ID') or os.getenv('API_ID')
+SAVEASBOT_API_HASH = os.getenv('SAVEASBOT_API_HASH') or os.getenv('API_HASH')
+SAVEASBOT_SESSION_PATH = os.getenv('SAVEASBOT_SESSION_PATH', '')
+SAVEASBOT_TIMEOUT_SEC = get_env_int('SAVEASBOT_TIMEOUT_SEC', 120)
+SAVEASBOT_TEXT_FOLLOWUP_SEC = get_env_float('SAVEASBOT_TEXT_FOLLOWUP_SEC', 30.0)
+SAVEASBOT_RESPONSE_IDLE_SEC = get_env_float('SAVEASBOT_RESPONSE_IDLE_SEC', 5.0)
+SAVEASBOT_MAX_RESPONSES = get_env_int('SAVEASBOT_MAX_RESPONSES', 10)
+SAVEASBOT_SEND_START = get_env_bool('SAVEASBOT_SEND_START', False)
+SAVEASBOT_POLL_INTERVAL_SEC = get_env_float('SAVEASBOT_POLL_INTERVAL_SEC', 1.0)
+SAVEASBOT_USER_ID = os.getenv('SAVEASBOT_USER_ID')
+SAVEASBOT_ACCESS_HASH = os.getenv('SAVEASBOT_ACCESS_HASH')
+
+_SAVEASBOT_CLIENT = None
+_SAVEASBOT_RUNTIME_SESSION: Path | None = None
+_SAVEASBOT_LOCK: asyncio.Lock | None = None
+_SAVEASBOT_STARTED = False
 
 # Safe ALLOWED_USER_IDS parser (comma-separated; ignores blanks/invalid)
 def parse_allowed_users(env_value: str) -> set[int]:
@@ -182,7 +240,10 @@ def get_stats_text(verbose: bool = False) -> str:
     lines = [f"Stats: {TOTAL_SUCCESS} ✅ / {TOTAL_FAIL} ❌"]
     
     cookie_lines = []
-    for path, name in [('./cookie_instagram.txt', 'Insta'), ('./cookie_youtube.txt', 'YouTube'), ('./cookie_threads.txt', 'Threads')]:
+    saveas_status = check_saveasbot_status(verbose)
+    if saveas_status:
+        cookie_lines.append(saveas_status)
+    for path, name in [('./cookie_youtube.txt', 'YouTube'), ('./cookie_threads.txt', 'Threads')]:
         stat = check_cookie_status(path, name, verbose)
         if stat:
             cookie_lines.append(stat)
@@ -192,6 +253,23 @@ def get_stats_text(verbose: bool = False) -> str:
         lines.extend(cookie_lines)
         
     return '\n'.join(lines)
+
+def check_saveasbot_status(verbose: bool = False) -> str | None:
+    if not verbose:
+        return None
+    missing = []
+    if not (SAVEASBOT_API_ID or os.getenv('API_ID')):
+        missing.append('API_ID')
+    if not (SAVEASBOT_API_HASH or os.getenv('API_HASH')):
+        missing.append('API_HASH')
+    if not SAVEASBOT_SESSION_PATH:
+        missing.append('SAVEASBOT_SESSION_PATH')
+    elif not Path(SAVEASBOT_SESSION_PATH).is_file():
+        missing.append('session file')
+
+    if missing:
+        return f"Instagram: ⚠️ SaveAsBot bridge missing {', '.join(missing)}"
+    return f"Instagram: 🟢 via @{SAVEASBOT_USERNAME}"
 
 def build_status(stage: str, attempt: int | None = None, max_attempts: int | None = None, progress: str | None = None) -> str:
     parts = [stage]
@@ -266,6 +344,385 @@ def build_safe_video_filename(url: str) -> str:
     else:
         base_name = 'video'
     return f"{base_name}.mp4"
+
+def clean_saveasbot_text(text: str | None) -> str:
+    if not text:
+        return ''
+    cleaned = text.replace('\u200b', '').strip()
+    if cleaned.lower() == 'рад был помочь! ваш, @saveasbot':
+        return ''
+    return cleaned
+
+def is_instagram_video_request(url: str) -> bool:
+    normalized = url.lower()
+    return any(part in normalized for part in ('/reel/', '/reels/', '/tv/', '/stories/'))
+
+def is_saveasbot_marketing_text(text: str | None) -> bool:
+    cleaned = clean_saveasbot_text(text).lower()
+    if not cleaned:
+        return False
+    marketing_markers = (
+        'нравится бот',
+        'поддержите его автора',
+        'донатом',
+        'бонусную подписку',
+        'отключение рекламы',
+        'отсутствие лимитов',
+        'семейка ботов',
+        'familybots',
+        'переходите и подписывайтесь',
+        'заберите бонус',
+    )
+    return any(marker in cleaned for marker in marketing_markers)
+
+def is_saveasbot_service_text(text: str | None) -> bool:
+    cleaned = clean_saveasbot_text(text)
+    if not cleaned:
+        return False
+    service_prefixes = (
+        'Для ценителей качества',
+        'Нажмите, чтобы получить текст поста',
+        'Привет! Наш бот всегда был бесплатным',
+        'Спасибо, что пользуетесь',
+    )
+    return any(cleaned.startswith(prefix) for prefix in service_prefixes) or is_saveasbot_marketing_text(cleaned)
+
+def is_saveasbot_quality_document_text(text: str | None) -> bool:
+    return clean_saveasbot_text(text).startswith('Для ценителей качества')
+
+def should_skip_saveasbot_media(text: str, kind: str, source_url: str, has_video_media: bool, has_primary_media: bool) -> bool:
+    if is_saveasbot_marketing_text(text):
+        return True
+    if has_primary_media and is_saveasbot_quality_document_text(text):
+        return True
+    if is_instagram_video_request(source_url) and has_video_media and kind != 'video':
+        return True
+    return False
+
+def trim_caption(text: str | None) -> str | None:
+    cleaned = clean_saveasbot_text(text)
+    if not cleaned:
+        return None
+    return cleaned[:1024]
+
+def get_saveasbot_lock() -> asyncio.Lock:
+    global _SAVEASBOT_LOCK
+    if _SAVEASBOT_LOCK is None:
+        _SAVEASBOT_LOCK = asyncio.Lock()
+    return _SAVEASBOT_LOCK
+
+def get_saveasbot_api_id() -> int:
+    if not SAVEASBOT_API_ID:
+        raise RuntimeError("SAVEASBOT_API_ID or API_ID is not configured")
+    try:
+        return int(SAVEASBOT_API_ID)
+    except ValueError as exc:
+        raise RuntimeError("SAVEASBOT_API_ID/API_ID must be an integer") from exc
+
+def normalize_telegram_username(username: str) -> str:
+    return username.strip().lstrip('@').lower()
+
+def build_saveasbot_peer(user_id: str | int, access_hash: str | int):
+    if InputPeerUser is None:
+        raise RuntimeError("Telethon is not installed; install requirements.txt")
+    try:
+        return InputPeerUser(int(user_id), int(access_hash))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("SAVEASBOT_USER_ID and SAVEASBOT_ACCESS_HASH must be integers") from exc
+
+def get_saveasbot_peer_from_env():
+    if not (SAVEASBOT_USER_ID or SAVEASBOT_ACCESS_HASH):
+        return None
+    if not (SAVEASBOT_USER_ID and SAVEASBOT_ACCESS_HASH):
+        logging.warning("Both SAVEASBOT_USER_ID and SAVEASBOT_ACCESS_HASH are required; ignoring partial peer config")
+        return None
+    return build_saveasbot_peer(SAVEASBOT_USER_ID, SAVEASBOT_ACCESS_HASH)
+
+def get_saveasbot_peer_from_session():
+    if _SAVEASBOT_RUNTIME_SESSION:
+        session_path = _SAVEASBOT_RUNTIME_SESSION
+    elif SAVEASBOT_SESSION_PATH:
+        session_path = Path(SAVEASBOT_SESSION_PATH)
+    else:
+        return None
+
+    if not session_path.is_file():
+        return None
+
+    username = normalize_telegram_username(SAVEASBOT_USERNAME)
+    try:
+        with sqlite3.connect(f"file:{session_path}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "select id, hash from entities where lower(username) = ? limit 1",
+                (username,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        logging.warning(f"Could not read SaveAsBot peer from session DB: {exc}")
+        return None
+
+    if not row:
+        return None
+    return build_saveasbot_peer(row[0], row[1])
+
+async def get_saveasbot_peer(client):
+    peer = get_saveasbot_peer_from_env()
+    if peer:
+        return peer
+
+    peer = get_saveasbot_peer_from_session()
+    if peer:
+        return peer
+
+    try:
+        return await client.get_input_entity(SAVEASBOT_USERNAME)
+    except Exception as exc:
+        raise RuntimeError(
+            "SaveAsBot peer is not in the Telegram session cache. "
+            "Open @SaveAsBot once from the tg_crawler account or set "
+            "SAVEASBOT_USER_ID and SAVEASBOT_ACCESS_HASH."
+        ) from exc
+
+def prepare_saveasbot_runtime_session() -> Path:
+    global _SAVEASBOT_RUNTIME_SESSION
+    if _SAVEASBOT_RUNTIME_SESSION and _SAVEASBOT_RUNTIME_SESSION.exists():
+        return _SAVEASBOT_RUNTIME_SESSION
+
+    if not SAVEASBOT_SESSION_PATH:
+        raise RuntimeError("SAVEASBOT_SESSION_PATH is not configured")
+
+    source = Path(SAVEASBOT_SESSION_PATH)
+    if not source.exists() or not source.is_file():
+        raise RuntimeError(f"SAVEASBOT_SESSION_PATH does not point to a session file: {source}")
+
+    runtime = Path(tempfile.gettempdir()) / f"saveasbot_{source.stem}_{os.getpid()}.session"
+    shutil.copy2(source, runtime)
+    _SAVEASBOT_RUNTIME_SESSION = runtime
+    return runtime
+
+async def ensure_saveasbot_client():
+    global _SAVEASBOT_CLIENT
+    if TelegramClient is None:
+        raise RuntimeError("Telethon is not installed; install requirements.txt")
+    if not SAVEASBOT_API_HASH:
+        raise RuntimeError("SAVEASBOT_API_HASH or API_HASH is not configured")
+
+    if _SAVEASBOT_CLIENT:
+        try:
+            if _SAVEASBOT_CLIENT.is_connected():
+                return _SAVEASBOT_CLIENT
+        except Exception:
+            with contextlib.suppress(Exception):
+                await _SAVEASBOT_CLIENT.disconnect()
+            _SAVEASBOT_CLIENT = None
+
+    runtime_session = prepare_saveasbot_runtime_session()
+    client = TelegramClient(
+        str(runtime_session),
+        get_saveasbot_api_id(),
+        SAVEASBOT_API_HASH,
+        receive_updates=False,
+    )
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise RuntimeError("SaveAsBot Telegram session is not authorized")
+
+    _SAVEASBOT_CLIENT = client
+    return client
+
+async def collect_saveasbot_responses(client, peer, after_message_id: int, timeout_sec: float, max_responses: int):
+    responses_by_id = {}
+    first_seen_at = None
+    last_seen_at = None
+    deadline = asyncio.get_running_loop().time() + max(timeout_sec, 10)
+    history_limit = max(max_responses * 3, 20)
+
+    while len(responses_by_id) < max_responses:
+        now = asyncio.get_running_loop().time()
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+
+        saw_new = False
+        messages = await client.get_messages(peer, limit=history_limit)
+        for message in sorted(messages, key=lambda msg: getattr(msg, 'id', 0) or 0):
+            message_id = getattr(message, 'id', 0) or 0
+            if message_id <= after_message_id or getattr(message, 'out', False):
+                continue
+            if message_id in responses_by_id:
+                continue
+
+            responses_by_id[message_id] = message
+            saw_new = True
+            now = asyncio.get_running_loop().time()
+            if first_seen_at is None:
+                first_seen_at = now
+            last_seen_at = now
+
+            if len(responses_by_id) >= max_responses:
+                break
+
+        responses = list(responses_by_id.values())
+        if responses and not saw_new:
+            has_media = any(getattr(message, 'media', None) for message in responses)
+            idle_limit = SAVEASBOT_RESPONSE_IDLE_SEC if has_media else SAVEASBOT_TEXT_FOLLOWUP_SEC
+            wait_started_at = last_seen_at if has_media else first_seen_at
+            if wait_started_at is not None and now - wait_started_at >= idle_limit:
+                break
+
+        await asyncio.sleep(min(max(SAVEASBOT_POLL_INTERVAL_SEC, 0.2), max(remaining, 0.2)))
+
+    return list(responses_by_id.values())
+
+async def warmup_saveasbot_dialog(client, peer) -> None:
+    global _SAVEASBOT_STARTED
+    if _SAVEASBOT_STARTED or not SAVEASBOT_SEND_START:
+        return
+
+    try:
+        sent = await client.send_message(peer, '/start')
+        with contextlib.suppress(Exception):
+            await collect_saveasbot_responses(client, peer, getattr(sent, 'id', 0) or 0, 20, 5)
+    except Exception as exc:
+        logging.warning(f"SaveAsBot warmup failed: {exc}")
+    finally:
+        _SAVEASBOT_STARTED = True
+
+def classify_saveasbot_media(message) -> str:
+    file_obj = getattr(message, 'file', None)
+    mime_type = getattr(file_obj, 'mime_type', '') or ''
+    if mime_type.startswith('image/'):
+        return 'photo'
+    if mime_type.startswith('video/'):
+        return 'video'
+    if mime_type.startswith('audio/'):
+        return 'audio'
+    return 'document'
+
+async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
+    lock = get_saveasbot_lock()
+    async with lock:
+        client = await ensure_saveasbot_client()
+        peer = await get_saveasbot_peer(client)
+        await warmup_saveasbot_dialog(client, peer)
+
+        sent = await client.send_message(peer, url)
+        sent_id = getattr(sent, 'id', 0) or 0
+        responses = await collect_saveasbot_responses(
+            client,
+            peer,
+            sent_id,
+            SAVEASBOT_TIMEOUT_SEC,
+            SAVEASBOT_MAX_RESPONSES,
+        )
+
+        items: list[dict[str, object]] = []
+        response_meta = [
+            (
+                message,
+                clean_saveasbot_text(getattr(message, 'message', '') or ''),
+                classify_saveasbot_media(message) if getattr(message, 'media', None) else '',
+            )
+            for message in responses
+        ]
+        has_primary_media = any(
+            kind and not is_saveasbot_quality_document_text(text) and not is_saveasbot_marketing_text(text)
+            for _, text, kind in response_meta
+        )
+        has_video_media = any(
+            kind == 'video' and not is_saveasbot_marketing_text(text)
+            for _, text, kind in response_meta
+        )
+
+        for message, text, kind in response_meta:
+            if getattr(message, 'media', None):
+                if should_skip_saveasbot_media(text, kind, url, has_video_media, has_primary_media):
+                    logging.info(
+                        "Skipping SaveAsBot non-request media: "
+                        f"id={getattr(message, 'id', None)} kind={kind} text={text[:80]!r}"
+                    )
+                    continue
+                downloaded_path = await client.download_media(message, file=TEMP_FOLDER)
+                if downloaded_path:
+                    items.append({
+                        'kind': kind,
+                        'path': downloaded_path,
+                        'text': '' if is_saveasbot_service_text(text) else text,
+                    })
+            elif text and not is_saveasbot_service_text(text):
+                items.append({'kind': 'text', 'text': text})
+
+        return items
+
+async def send_text_chunks(update: Update, text: str) -> None:
+    for start in range(0, len(text), 3900):
+        chunk = text[start:start + 3900]
+        if chunk:
+            await update.message.reply_text(chunk)
+
+async def send_saveasbot_items(update: Update, items: list[dict[str, object]]) -> bool:
+    media_items = [item for item in items if item.get('path')]
+    text_items = [str(item.get('text') or '') for item in items if item.get('kind') == 'text' and item.get('text')]
+
+    if media_items and len(media_items) > 1 and all(item.get('kind') in {'photo', 'video'} for item in media_items):
+        handles = []
+        try:
+            media_group = []
+            for idx, item in enumerate(media_items[:10]):
+                path = str(item['path'])
+                handle = open(path, 'rb')
+                handles.append(handle)
+                caption = trim_caption(str(item.get('text') or '')) if idx == 0 else None
+                if item.get('kind') == 'video':
+                    media_group.append(InputMediaVideo(handle, caption=caption, supports_streaming=True))
+                else:
+                    media_group.append(InputMediaPhoto(handle, caption=caption))
+            await update.message.reply_media_group(media_group)
+        finally:
+            for handle in handles:
+                with contextlib.suppress(Exception):
+                    handle.close()
+
+        for item in media_items[10:]:
+            await send_single_saveasbot_media(update, item)
+    else:
+        for item in media_items:
+            await send_single_saveasbot_media(update, item)
+
+    for text in text_items:
+        await send_text_chunks(update, text)
+
+    return bool(media_items or text_items)
+
+async def send_single_saveasbot_media(update: Update, item: dict[str, object]) -> None:
+    path = str(item['path'])
+    caption = trim_caption(str(item.get('text') or ''))
+    kind = str(item.get('kind') or 'document')
+
+    with open(path, 'rb') as media:
+        if kind == 'photo':
+            await update.message.reply_photo(media, caption=caption, write_timeout=300, read_timeout=300, connect_timeout=60)
+        elif kind == 'video':
+            await update.message.reply_video(
+                media,
+                caption=caption,
+                supports_streaming=True,
+                filename=build_safe_video_filename(update.message.text or ''),
+                write_timeout=300,
+                read_timeout=300,
+                connect_timeout=60
+            )
+        elif kind == 'audio':
+            await update.message.reply_audio(media, caption=caption, write_timeout=300, read_timeout=300, connect_timeout=60)
+        else:
+            await update.message.reply_document(media, caption=caption, write_timeout=300, read_timeout=300, connect_timeout=60)
+
+def cleanup_saveasbot_items(items: list[dict[str, object]]) -> None:
+    for item in items:
+        path = item.get('path')
+        if path and os.path.exists(str(path)):
+            with contextlib.suppress(Exception):
+                os.remove(str(path))
 
 def resolve_audio_source(query: str) -> str:
     if not query.startswith('ytsearch'):
@@ -396,94 +853,29 @@ def build_video_profiles(is_vertical: bool) -> list[dict[str, object]]:
 
 async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
-    shortcode_match = re.search(r'(?:instagram\.com|instagr\.am)/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
-    if not shortcode_match:
-        await download_and_send_video(update, context)
-        return
+    msg = await update.message.reply_text(build_status('⏳ Sending Instagram link to SaveAsBot...'))
+    items: list[dict[str, object]] = []
 
-    shortcode = shortcode_match.group(1)
-    msg = await update.message.reply_text(build_status('⏳ Fetching Instagram metadata...'))
-    
     try:
-        L = instaloader.Instaloader(
-            download_pictures=False,
-            download_videos=False, 
-            download_video_thumbnails=False,
-            download_geotags=False,
-            download_comments=False,
-            save_metadata=False,
-            compress_json=False,
-            user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
-        )
-        
-        cookie_file = get_cookie_file(url)
-        if os.path.exists(cookie_file):
-            cj = load_cookies_to_jar(cookie_file)
-            L.context._session.cookies = cj
-
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-
-        if post.typename == 'GraphVideo':
-            await msg.delete()
-            await download_and_send_video(update, context)
-            return
-
-        elif post.typename == 'GraphImage':
-            await msg.edit_text(build_status('⏳ Downloading image...'))
-            r = L.context._session.get(post.url)
-            filename = f"{TEMP_FOLDER}/{shortcode}.jpg"
-            with open(filename, 'wb') as f:
-                f.write(r.content)
-            
-            await update.message.reply_photo(open(filename, 'rb'))
-            os.remove(filename)
-            await msg.edit_text(build_status('✅ Done.'))
+        items = await request_saveasbot_items(url)
+        await msg.edit_text(build_status('📤 Uploading SaveAsBot response...'))
+        sent_anything = await send_saveasbot_items(update, items)
+        if sent_anything:
             increment_success()
-
-        elif post.typename == 'GraphSidecar':
-            await msg.edit_text(build_status('⏳ Downloading carousel...'))
-            media_group = []
-            files_to_cleanup = []
-            
-            nodes = list(post.get_sidecar_nodes())
-            
-            for i, node in enumerate(nodes):
-                if node.is_video:
-                    video_url = node.video_url
-                    fname = f"{TEMP_FOLDER}/{shortcode}_{i}.mp4"
-                    r = L.context._session.get(video_url)
-                    with open(fname, 'wb') as f:
-                        f.write(r.content)
-                    media_group.append(InputMediaVideo(open(fname, 'rb')))
-                    files_to_cleanup.append(fname)
-                else:
-                    image_url = node.display_url
-                    fname = f"{TEMP_FOLDER}/{shortcode}_{i}.jpg"
-                    r = L.context._session.get(image_url)
-                    with open(fname, 'wb') as f:
-                        f.write(r.content)
-                    media_group.append(InputMediaPhoto(open(fname, 'rb')))
-                    files_to_cleanup.append(fname)
-            
-            chunk_size = 10
-            for i in range(0, len(media_group), chunk_size):
-                chunk = media_group[i:i + chunk_size]
-                await update.message.reply_media_group(chunk)
-            
-            for f in files_to_cleanup:
-                if os.path.exists(f): os.remove(f)
-                
             await msg.edit_text(build_status('✅ Done.'))
-            increment_success()
-        
         else:
-             await msg.delete()
-             await download_and_send_video(update, context)
-
+            increment_fail()
+            await msg.edit_text(build_status('❌ SaveAsBot did not return media or text.'))
+    except RPCError as e:
+        logging.error(f"SaveAsBot Telegram RPC error: {e}")
+        increment_fail()
+        await msg.edit_text(build_status('❌ Telegram user session failed to send the link.'))
     except Exception as e:
-        logging.error(f"Instaloader error: {e}")
-        await msg.edit_text(build_status(f'⚠️ Instaloader failed, trying fallback...'))
-        await download_and_send_video(update, context)
+        logging.exception(f"SaveAsBot bridge error: {e}")
+        increment_fail()
+        await msg.edit_text(build_status('❌ SaveAsBot bridge failed.'))
+    finally:
+        cleanup_saveasbot_items(items)
 
 async def process_threads_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Normalize URL: force threads.net
@@ -613,7 +1005,7 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Route to specific downloaders
-    if 'instagram.com' in text:
+    if 'instagram.com' in text or 'instagr.am' in text:
         await process_instagram_link(update, context)
     elif 'threads.net' in text or 'threads.com' in text:
         await process_threads_link(update, context)

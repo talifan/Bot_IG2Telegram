@@ -9,11 +9,22 @@ services:
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
       - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID}
       - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET}
+      - SAVEASBOT_API_ID=${SAVEASBOT_API_ID:-}
+      - SAVEASBOT_API_HASH=${SAVEASBOT_API_HASH:-}
+      - SAVEASBOT_SESSION_PATH=${SAVEASBOT_SESSION_PATH:-/app/saveasbot.session}
+      - SAVEASBOT_USERNAME=${SAVEASBOT_USERNAME:-SaveAsBot}
+      - SAVEASBOT_TIMEOUT_SEC=${SAVEASBOT_TIMEOUT_SEC:-120}
+      - SAVEASBOT_SEND_START=${SAVEASBOT_SEND_START:-0}
+      - SAVEASBOT_POLL_INTERVAL_SEC=${SAVEASBOT_POLL_INTERVAL_SEC:-1}
+      - SAVEASBOT_USER_ID=${SAVEASBOT_USER_ID:-}
+      - SAVEASBOT_ACCESS_HASH=${SAVEASBOT_ACCESS_HASH:-}
     volumes:
       # Mount cookies if you use private/limited videos
       - ./cookie_instagram.txt:/app/cookie_instagram.txt:rw
       - ./cookie_youtube.txt:/app/cookie_youtube.txt:rw
       - ./cookie_threads.txt:/app/cookie_threads.txt:rw
+      # Read-only Telethon session used only for Instagram -> @SaveAsBot bridge.
+      - ${SAVEASBOT_SESSION_HOST_PATH:-./saveasbot.session}:/app/saveasbot.session:ro
       # Optional: persist temp if desired
       - ./temp:/app/temp
     restart: unless-stopped
