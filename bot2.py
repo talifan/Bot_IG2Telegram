@@ -682,6 +682,9 @@ async def send_text_chunks(update: Update, text: str) -> None:
 async def send_saveasbot_items(update: Update, items: list[dict[str, object]]) -> bool:
     media_items = [item for item in items if item.get('path')]
     text_items = [str(item.get('text') or '') for item in items if item.get('kind') == 'text' and item.get('text')]
+    if media_items and text_items:
+        logging.info(f"Dropping {len(text_items)} SaveAsBot text item(s) because media was returned")
+        text_items = []
 
     if media_items and len(media_items) > 1 and all(item.get('kind') in {'photo', 'video'} for item in media_items):
         handles = []

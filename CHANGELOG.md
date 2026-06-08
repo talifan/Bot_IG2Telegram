@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 - **fix: Avoid Telethon update parsing failures in the Instagram bridge**: The SaveAsBot bridge now resolves `@SaveAsBot` from the session cache or explicit peer IDs, disables background updates, polls the direct dialog history for replies, and keeps media messages even when `@SaveAsBot` adds service captions.
 - **fix: Filter SaveAsBot ads from Instagram video replies**: Reel/Stories responses now drop marketing text, bonus/ad images, and non-video media when the requested response includes video.
 - **fix: Return SaveAsBot terminal errors immediately**: Explicit failure messages such as private/age-restricted Instagram publications now end the bridge wait loop immediately and are relayed back as text.
+- **fix: Suppress SaveAsBot text after media**: Instagram responses that include media no longer send separate text items after the photo/video; text-only terminal errors are still relayed.
 - **chore: Add SaveAsBot Docker configuration**: `docker-compose.yml` now accepts `SAVEASBOT_*` variables, mounts a read-only Telethon session file, and ignores local `.session` files.
 - **docs: Update Instagram operation docs**: README files now describe the SaveAsBot bridge and remove Instagram cookie requirements.
 
