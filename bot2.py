@@ -615,7 +615,7 @@ def classify_saveasbot_media(message) -> str:
         return 'audio'
     return 'document'
 
-async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
+async def request_saveasbot_items(url: str, msg = None) -> list[dict[str, object]]:
     lock = get_saveasbot_lock()
     async with lock:
         client = await ensure_saveasbot_client()
@@ -670,6 +670,76 @@ async def request_saveasbot_items(url: str) -> list[dict[str, object]]:
             elif text and not is_saveasbot_service_text(text):
                 items.append({'kind': 'text', 'text': text})
 
+        # Fallback: check if we have a direct video link in the text messages and no video has been downloaded yet
+        if not any(item.get('kind') == 'video' for item in items):
+            extracted_video_url = None
+            for message, text, kind in response_meta:
+                if getattr(message, 'entities', None):
+                    for ent in message.entities:
+                        if ent.__class__.__name__ == 'MessageEntityTextUrl':
+                            ent_url = getattr(ent, 'url', '') or ''
+                            ent_text = ''
+                            if message.message and ent.offset is not None and ent.length is not None:
+                                ent_text = message.message[ent.offset : ent.offset + ent.length].lower()
+                            if 'скачать' in ent_text or 'download' in ent_text or '.mp4' in ent_url.lower() or 'video' in ent_text:
+                                if 'fbcdn.net' in ent_url or '.mp4' in ent_url or 'instagram' in ent_url:
+                                    extracted_video_url = ent_url
+                                    break
+                    if extracted_video_url:
+                        break
+            
+            if extracted_video_url:
+                logging.info(f"Found direct video URL from SaveAsBot: {extracted_video_url}")
+                if msg:
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(build_status('⚠️ Слишком большое видео (>50MB). Переключение на прямую ссылку...'))
+                        await asyncio.sleep(1.0)
+                        await msg.edit_text(build_status('⏳ Закачка видео по прямой ссылке...'))
+                
+                downloaded_path = os.path.join(TEMP_FOLDER, f"{uuid.uuid4()}.mp4")
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+                    }
+                    def download_file(src_url, dest_path):
+                        r = requests.get(src_url, headers=headers, stream=True, timeout=60)
+                        r.raise_for_status()
+                        with open(dest_path, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, download_file, extracted_video_url, downloaded_path)
+                    
+                    if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:
+                        if msg:
+                            with contextlib.suppress(Exception):
+                                await msg.edit_text(build_status('⚙️ Перекодирование видео (оптимизация размера и качества)...'))
+                        
+                        compressed_path = os.path.join(TEMP_FOLDER, f"{uuid.uuid4()}_compressed.mp4")
+                        logging.info(f"Normalizing direct video file: {downloaded_path}")
+                        def transcode():
+                            return compress_video(downloaded_path, compressed_path, prefer_vertical=None)
+                        
+                        success = await loop.run_in_executor(None, transcode)
+                        if success:
+                            os.remove(downloaded_path)
+                            downloaded_path = compressed_path
+                        
+                        items.append({
+                            'kind': 'video',
+                            'path': downloaded_path,
+                            'text': '',
+                        })
+                except Exception as e:
+                    logging.exception(f"Failed to download or transcode direct video URL: {e}")
+                    if os.path.exists(downloaded_path):
+                        try:
+                            os.remove(downloaded_path)
+                        except Exception:
+                            pass
+
         logging.info(f"Prepared {len(items)} SaveAsBot item(s) for Telegram reply")
         return items
 
@@ -680,6 +750,15 @@ async def send_text_chunks(update: Update, text: str) -> None:
             await update.message.reply_text(chunk)
 
 async def send_saveasbot_items(update: Update, items: list[dict[str, object]]) -> bool:
+    # Filter items to only keep video items and clear their captions
+    # "не пропускай ничего кроме видео в ответы в чате мне."
+    video_items = []
+    for item in items:
+        if item.get('kind') == 'video':
+            item['text'] = ''  # Clear text/caption
+            video_items.append(item)
+    items = video_items
+
     media_items = [item for item in items if item.get('path')]
     text_items = [str(item.get('text') or '') for item in items if item.get('kind') == 'text' and item.get('text')]
     if media_items and text_items:
@@ -879,8 +958,8 @@ async def process_instagram_link(update: Update, context: ContextTypes.DEFAULT_T
     items: list[dict[str, object]] = []
 
     try:
-        items = await request_saveasbot_items(url)
-        await msg.edit_text(build_status('📤 Uploading SaveAsBot response...'))
+        items = await request_saveasbot_items(url, msg=msg)
+        await msg.edit_text(build_status('📤 Отправка готового видео...'))
         sent_anything = await send_saveasbot_items(update, items)
         if sent_anything:
             increment_success()
