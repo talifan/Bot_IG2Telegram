@@ -750,14 +750,14 @@ async def send_text_chunks(update: Update, text: str) -> None:
             await update.message.reply_text(chunk)
 
 async def send_saveasbot_items(update: Update, items: list[dict[str, object]]) -> bool:
-    # Filter items to only keep video items and clear their captions
-    # "не пропускай ничего кроме видео в ответы в чате мне."
-    video_items = []
+    # Filter items to only keep video and photo items, and clear their captions
+    # "не пропускай ничего кроме видео/фото в ответы в чате мне."
+    allowed_items = []
     for item in items:
-        if item.get('kind') == 'video':
+        if item.get('kind') in {'video', 'photo'}:
             item['text'] = ''  # Clear text/caption
-            video_items.append(item)
-    items = video_items
+            allowed_items.append(item)
+    items = allowed_items
 
     media_items = [item for item in items if item.get('path')]
     text_items = [str(item.get('text') or '') for item in items if item.get('kind') == 'text' and item.get('text')]
